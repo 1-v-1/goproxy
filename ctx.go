@@ -23,6 +23,7 @@ type ProxyCtx struct {
 	Session   int64
 	certStore CertStorage
 	Proxy     *ProxyHttpServer
+	RawRequest []byte
 }
 
 type RoundTripper interface {
