@@ -168,7 +168,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		for {
 			client := bufio.NewReader(proxyClient)
 			remote := bufio.NewReader(targetSiteCon)
-			req, err := http.ReadRequest(client)
+			var clientCopy bytes.Buffer
+			rawRequestBuf := io.TeeReader(client, &clientCopy)
+			ctx.RawRequest,_ = io.ReadAll(rawRequestBuf)
+			req, err := http.ReadRequest(bufio.NewReader(&clientCopy))
 			if err != nil && err != io.EOF {
 				ctx.Warnf("cannot read request of MITM HTTP client: %+#v", err)
 			}
@@ -220,8 +223,11 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			}
 			clientTlsReader := bufio.NewReader(rawClientTls)
 			for !isEof(clientTlsReader) {
-				req, err := http.ReadRequest(clientTlsReader)
+				var clientTlsReaderCopy bytes.Buffer
+				rawRequestBuf := io.TeeReader(clientTlsReader, &clientTlsReaderCopy)
+				req, err := http.ReadRequest(bufio.NewReader(&clientTlsReaderCopy))
 				var ctx = &ProxyCtx{Req: req, Session: atomic.AddInt64(&proxy.sess, 1), Proxy: proxy, UserData: ctx.UserData}
+				ctx.RawRequest,_ = io.ReadAll(rawRequestBuf)
 				if err != nil && err != io.EOF {
 					return
 				}
