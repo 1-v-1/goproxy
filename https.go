@@ -1,6 +1,7 @@
 package goproxy
 
 import (
+	"bytes"
 	"bufio"
 	"crypto/tls"
 	"errors"
