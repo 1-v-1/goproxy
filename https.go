@@ -1,11 +1,13 @@
 package goproxy
 
 import (
-	"bytes"
 	"bufio"
+	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"golang.org/x/net/http2"
 	"io"
 	"io/ioutil"
 	"net"
@@ -73,8 +75,11 @@ func stripPort(s string) string {
 }
 
 func (proxy *ProxyHttpServer) dial(network, addr string) (c net.Conn, err error) {
-	if proxy.Tr.Dial != nil {
-		return proxy.Tr.Dial(network, addr)
+	//if proxy.Tr.Dial != nil {
+	//	return proxy.Tr.Dial(network, addr)
+	//}
+	if proxy.Tr.DialContext != nil {
+		return proxy.Tr.DialContext(context.Background(), network, addr)
 	}
 	return net.Dial(network, addr)
 }
@@ -169,10 +174,22 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		for {
 			client := bufio.NewReader(proxyClient)
 			remote := bufio.NewReader(targetSiteCon)
+
 			var clientCopy bytes.Buffer
-			rawRequestBuf := io.TeeReader(client, &clientCopy)
-			ctx.RawRequest,_ = io.ReadAll(rawRequestBuf)
-			req, err := http.ReadRequest(bufio.NewReader(&clientCopy))
+			tee := io.TeeReader(client, &clientCopy)
+			req, err := http.ReadRequest(bufio.NewReader(tee))
+			ctx.RawRequest, _ = io.ReadAll(&clientCopy)
+
+			lines := strings.Split(strings.Split(string(ctx.RawRequest), "\r\n\r\n")[0], "\r\n")
+			keys := make([]string, 0, len(lines))
+			for _, line := range lines[1:] {
+				parts := strings.Split(line, ":")
+				if len(parts) > 0 {
+					keys = append(keys, parts[0])
+				}
+			}
+			ctx.HeaderOrder = keys
+
 			if err != nil && err != io.EOF {
 				ctx.Warnf("cannot read request of MITM HTTP client: %+#v", err)
 			}
@@ -222,13 +239,69 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
 				return
 			}
+			//判断是否协商了http2
+			if rawClientTls.ConnectionState().NegotiatedProtocol == "h2" {
+				ctx.Logf("Client is using HTTP2")
+				h2Server := &http2.Server{}
+
+				h2Server.ServeConn(rawClientTls, &http2.ServeConnOpts{
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+						if isWebSocketRequest(req) {
+							ctx.Logf("Request looks like websocket upgrade.")
+							proxy.serveWebsocketTLS(ctx, w, req, tlsConfig, rawClientTls)
+							return
+						}
+						if !httpsRegexp.MatchString(req.URL.String()) {
+							req.URL, _ = url.Parse("https://" + r.Host + req.URL.String())
+						}
+						ctx.Req = req
+						req, resp := proxy.filterRequest(req, ctx)
+						removeProxyHeaders(ctx, req)
+						resp, err := func() (*http.Response, error) {
+							defer req.Body.Close()
+							return ctx.RoundTrip(req)
+							//return http.DefaultTransport.RoundTrip(req)
+						}()
+						if err != nil {
+							http.Error(w, "", http.StatusInternalServerError)
+							ctx.Warnf("Cannot read HTTP2 response from mitm'd server %v", err)
+							return
+						}
+						resp = proxy.filterResponse(resp, ctx)
+						defer resp.Body.Close()
+
+						// Copy response headers
+						for k, v := range resp.Header {
+							w.Header()[k] = v
+						}
+
+						w.WriteHeader(resp.StatusCode)
+						io.Copy(w, resp.Body)
+						return
+					}),
+				})
+			}
 			clientTlsReader := bufio.NewReader(rawClientTls)
 			for !isEof(clientTlsReader) {
+
 				var clientTlsReaderCopy bytes.Buffer
-				rawRequestBuf := io.TeeReader(clientTlsReader, &clientTlsReaderCopy)
-				req, err := http.ReadRequest(bufio.NewReader(&clientTlsReaderCopy))
+				tee := io.TeeReader(clientTlsReader, &clientTlsReaderCopy)
+				req, err := http.ReadRequest(bufio.NewReader(tee))
+
 				var ctx = &ProxyCtx{Req: req, Session: atomic.AddInt64(&proxy.sess, 1), Proxy: proxy, UserData: ctx.UserData}
-				ctx.RawRequest,_ = io.ReadAll(rawRequestBuf)
+				ctx.RawRequest, _ = io.ReadAll(&clientTlsReaderCopy)
+
+				//lines := strings.Split(strings.Trim(string(ctx.RawRequest), "\r\n"), "\r\n")
+				lines := strings.Split(strings.Split(string(ctx.RawRequest), "\r\n\r\n")[0], "\r\n")
+				keys := make([]string, 0, len(lines))
+				for _, line := range lines[1:] {
+					parts := strings.Split(line, ":")
+					if len(parts) > 0 {
+						keys = append(keys, parts[0])
+					}
+				}
+				ctx.HeaderOrder = keys
+
 				if err != nil && err != io.EOF {
 					return
 				}
@@ -303,12 +376,14 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				defer resp.Body.Close()
 
 				text := resp.Status
+				protoMajor, protoMinor := strconv.Itoa(resp.ProtoMajor), strconv.Itoa(resp.ProtoMinor)
 				statusCode := strconv.Itoa(resp.StatusCode) + " "
 				if strings.HasPrefix(text, statusCode) {
 					text = text[len(statusCode):]
 				}
 				// always use 1.1 to support chunked encoding
-				if _, err := io.WriteString(rawClientTls, "HTTP/1.1"+" "+statusCode+text+"\r\n"); err != nil {
+				//if _, err := io.WriteString(rawClientTls, "HTTP/1.1"+" "+statusCode+text+"\r\n"); err != nil {
+				if _, err := io.WriteString(rawClientTls, "HTTP/"+protoMajor+"."+protoMinor+" "+statusCode+text+"\r\n"); err != nil {
 					ctx.Warnf("Cannot write TLS response HTTP status from mitm'd client: %v", err)
 					return
 				}
@@ -519,6 +594,7 @@ func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls
 		}
 
 		config.Certificates = append(config.Certificates, *cert)
+		config.NextProtos = []string{"h2", "http/1.1"}
 		return config, nil
 	}
 }

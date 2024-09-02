@@ -2,6 +2,7 @@ package goproxy
 
 import (
 	"bufio"
+	rreq "github.com/imroc/req/v3"
 	"io"
 	"log"
 	"net"
@@ -10,6 +11,10 @@ import (
 	"regexp"
 	"sync/atomic"
 )
+
+type Transporter interface {
+	RoundTrip(*http.Request) (*http.Response, error)
+}
 
 // The basic proxy type. Implements http.Handler.
 type ProxyHttpServer struct {
@@ -25,7 +30,8 @@ type ProxyHttpServer struct {
 	reqHandlers     []ReqHandler
 	respHandlers    []RespHandler
 	httpsHandlers   []HttpsHandler
-	Tr              *http.Transport
+	//Tr              *http.Transport
+	Tr *rreq.Transport
 	// ConnectDial will be used to create TCP connections for CONNECT requests
 	// if nil Tr.Dial will be used
 	ConnectDial        func(network string, addr string) (net.Conn, error)
@@ -217,7 +223,8 @@ func NewProxyHttpServer() *ProxyHttpServer {
 		NonproxyHandler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "This is a proxy server. Does not respond to non-proxy requests.", 500)
 		}),
-		Tr: &http.Transport{TLSClientConfig: tlsClientSkipVerify, Proxy: http.ProxyFromEnvironment},
+		//Tr: &http.Transport{TLSClientConfig: tlsClientSkipVerify, Proxy: http.ProxyFromEnvironment},
+		Tr: rreq.C().GetTransport(),
 	}
 
 	proxy.ConnectDial = dialerFromEnv(&proxy)

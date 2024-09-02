@@ -54,7 +54,8 @@ func signHost(ca tls.Certificate, hosts []string) (cert *tls.Certificate, err er
 		SerialNumber: serial,
 		Issuer:       x509ca.Subject,
 		Subject: pkix.Name{
-			Organization: []string{"GoProxy untrusted MITM proxy Inc"},
+			//Organization: []string{"GoProxy untrusted MITM proxy Inc"},
+			Organization: []string{hosts[0] + " Inc"},
 		},
 		NotBefore: start,
 		NotAfter:  end,
