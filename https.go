@@ -7,11 +7,15 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/imroc/req/v3"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
@@ -239,25 +243,183 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
 				return
 			}
+
 			//判断是否协商了http2
 			if rawClientTls.ConnectionState().NegotiatedProtocol == "h2" {
 				ctx.Logf("Client is using HTTP2")
-				h2Server := &http2.Server{}
 
-				h2Server.ServeConn(rawClientTls, &http2.ServeConnOpts{
+				//pr, pw := io.Pipe()
+				//tee := io.TeeReader(rawClientTls, pw)
+				//go func() {
+				//	b := make([]byte, len(http2.ClientPreface))
+				//	if _, err := io.ReadFull(pr, b); err != nil {
+				//		log.Println("read preface err", err)
+				//	}
+				//
+				//	framer := http2.NewFramer(nil, pr)
+				//	for {
+				//		frame, err := framer.ReadFrame()
+				//		if err == io.EOF {
+				//			log.Println("EOF")
+				//			return
+				//		}
+				//		if err != nil {
+				//			log.Println("read frame err", err)
+				//		}
+				//		switch f := frame.(type) {
+				//		case *http2.HeadersFrame:
+				//			//log.Println("headers", f.HeaderBlockFragment())
+				//			hpackDecoder := hpack.NewDecoder(4096, func(hf hpack.HeaderField) {})
+				//			headerFields, err := hpackDecoder.DecodeFull(f.HeaderBlockFragment())
+				//			if err != nil {
+				//				log.Fatalf("Failed to decode header block: %v", err)
+				//			}
+				//			for _, v := range headerFields {
+				//				log.Println(v)
+				//			}
+				//
+				//		case *http2.DataFrame:
+				//			fmt.Printf("Data frame received: %s\n", string(f.Data()))
+				//		default:
+				//			log.Println("frame", frame)
+				//
+				//		}
+				//	}
+				//}()
+
+				pr, pw := io.Pipe()
+				go func() {
+					b := make([]byte, len(http2.ClientPreface))
+					if _, err := io.ReadFull(rawClientTls, b); err != nil {
+						log.Println("read preface err", err)
+					}
+					pw.Write(b)
+
+					framer := http2.NewFramer(nil, rawClientTls)
+					framer2 := http2.NewFramer(pw, nil)
+					for {
+						frame, err := framer.ReadFrame()
+						if err == io.EOF {
+							log.Println("EOF")
+							pw.Close()
+							return
+						}
+						if err != nil {
+							//log.Println("read frame err", err)  每一次请求结束都会到这来，或许有更好的转发方式
+							pw.Close()
+							return
+						}
+						header := frame.Header()
+						hDec := hpack.NewDecoder(4096, func(hf hpack.HeaderField) {})
+						hEnc := hpack.NewEncoder(pw)
+						hBuf := bytes.NewBuffer(nil)
+
+						switch f := frame.(type) {
+						case *http2.DataFrame:
+							framer2.WriteData(header.StreamID, false, f.Data())
+						case *http2.HeadersFrame:
+							headerFields, err := hDec.DecodeFull(f.HeaderBlockFragment())
+							if err != nil {
+								log.Printf("Failed to decode header block: %v\n", err)
+								pw.Close()
+							}
+
+							hBuf.Reset()
+							headerOderKey := ""
+							pseudoHeaderOderKey := ""
+							for k, v := range headerFields {
+								if k < 4 {
+									pseudoHeaderOderKey += v.Name + ","
+								} else {
+									headerOderKey += v.Name + ","
+								}
+								hEnc.WriteField(hpack.HeaderField{Name: v.Name, Value: v.Value})
+							}
+							//先省略了ctx.rawHeader、order的写入 后面使用时要注意
+							hEnc.WriteField(hpack.HeaderField{Name: req.HeaderOderKey, Value: headerOderKey})
+							hEnc.WriteField(hpack.HeaderField{Name: req.PseudoHeaderOderKey, Value: pseudoHeaderOderKey})
+							framer2.WriteHeaders(http2.HeadersFrameParam{
+								StreamID: header.StreamID,
+								//BlockFragment: f.HeaderBlockFragment(),
+								BlockFragment: hBuf.Bytes(),
+								EndStream:     f.StreamEnded(),
+								EndHeaders:    f.HeadersEnded(),
+								PadLength:     0,
+								Priority:      f.Priority,
+							})
+						case *http2.PriorityFrame:
+							framer2.WritePriority(header.StreamID, f.PriorityParam)
+						case *http2.RSTStreamFrame:
+							framer2.WriteRSTStream(header.StreamID, f.ErrCode)
+						case *http2.SettingsFrame:
+							//这样会报错connection error: PROTOCOL_ERROR
+							//settings := make([]http2.Setting, f.NumSettings())
+							//for i := 0; i < f.NumSettings(); i++ {
+							//	settings[i] = f.Setting(i)
+							//}
+							//err := framer2.WriteSettings(settings...)
+
+							var buf []byte
+							for i := 0; i < f.NumSettings(); i++ {
+								setting := f.Setting(i)
+								buf = append(buf, byte(setting.ID>>8), byte(setting.ID), byte(setting.Val>>24), byte(setting.Val>>16), byte(setting.Val>>8), byte(setting.Val))
+							}
+							framer2.WriteRawFrame(header.Type, header.Flags, header.StreamID, buf)
+
+						case *http2.PushPromiseFrame:
+							framer2.WriteRawFrame(header.Type, header.Flags, header.StreamID, f.HeaderBlockFragment())
+						case *http2.PingFrame:
+							framer2.WritePing(f.IsAck(), f.Data)
+						case *http2.GoAwayFrame:
+							framer2.WriteGoAway(f.LastStreamID, f.ErrCode, f.DebugData())
+						case *http2.WindowUpdateFrame:
+							framer2.WriteWindowUpdate(header.StreamID, f.Increment)
+						case *http2.ContinuationFrame:
+							framer2.WriteContinuation(header.StreamID, f.HeadersEnded(), f.HeaderBlockFragment())
+						case *http2.UnknownFrame:
+							framer2.WriteRawFrame(header.Type, header.Flags, header.StreamID, f.Payload())
+						default:
+							log.Println("未知帧")
+						}
+					}
+				}()
+				//可以在上面直接拿到res了 只是要自己处理stream
+				conn := &teeConn{
+					Conn:   rawClientTls,
+					reader: pr,
+				}
+				h2Server := &http2.Server{}
+				h2Server.ServeConn(conn, &http2.ServeConnOpts{
 					Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 						if isWebSocketRequest(req) {
 							ctx.Logf("Request looks like websocket upgrade.")
 							proxy.serveWebsocketTLS(ctx, w, req, tlsConfig, rawClientTls)
 							return
 						}
+
+						rawRequest, err := httputil.DumpRequest(req, false)
+						if err != nil {
+							ctx.Warnf("Cannot dump request: %v", err)
+							return
+						}
+						ctx.RawRequest = rawRequest
+						lines := strings.Split(strings.Split(string(ctx.RawRequest), "\r\n\r\n")[0], "\r\n")
+						keys := make([]string, 0, len(lines))
+						for _, line := range lines[1:] {
+							parts := strings.Split(line, ":")
+							if len(parts) > 0 {
+								keys = append(keys, parts[0])
+							}
+						}
+						ctx.HeaderOrder = keys
+
 						if !httpsRegexp.MatchString(req.URL.String()) {
 							req.URL, _ = url.Parse("https://" + r.Host + req.URL.String())
 						}
 						ctx.Req = req
 						req, resp := proxy.filterRequest(req, ctx)
 						removeProxyHeaders(ctx, req)
-						resp, err := func() (*http.Response, error) {
+						resp, err = func() (*http.Response, error) {
 							defer req.Body.Close()
 							return ctx.RoundTrip(req)
 							//return http.DefaultTransport.RoundTrip(req)
@@ -597,4 +759,13 @@ func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls
 		config.NextProtos = []string{"h2", "http/1.1"}
 		return config, nil
 	}
+}
+
+type teeConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (t *teeConn) Read(b []byte) (int, error) {
+	return t.reader.Read(b)
 }
