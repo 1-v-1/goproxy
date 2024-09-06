@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/imroc/req/v3"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 	"io"
@@ -15,7 +14,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
@@ -247,47 +245,8 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			//判断是否协商了http2
 			if rawClientTls.ConnectionState().NegotiatedProtocol == "h2" {
 				ctx.Logf("Client is using HTTP2")
-
-				//pr, pw := io.Pipe()
-				//tee := io.TeeReader(rawClientTls, pw)
-				//go func() {
-				//	b := make([]byte, len(http2.ClientPreface))
-				//	if _, err := io.ReadFull(pr, b); err != nil {
-				//		log.Println("read preface err", err)
-				//	}
-				//
-				//	framer := http2.NewFramer(nil, pr)
-				//	for {
-				//		frame, err := framer.ReadFrame()
-				//		if err == io.EOF {
-				//			log.Println("EOF")
-				//			return
-				//		}
-				//		if err != nil {
-				//			log.Println("read frame err", err)
-				//		}
-				//		switch f := frame.(type) {
-				//		case *http2.HeadersFrame:
-				//			//log.Println("headers", f.HeaderBlockFragment())
-				//			hpackDecoder := hpack.NewDecoder(4096, func(hf hpack.HeaderField) {})
-				//			headerFields, err := hpackDecoder.DecodeFull(f.HeaderBlockFragment())
-				//			if err != nil {
-				//				log.Fatalf("Failed to decode header block: %v", err)
-				//			}
-				//			for _, v := range headerFields {
-				//				log.Println(v)
-				//			}
-				//
-				//		case *http2.DataFrame:
-				//			fmt.Printf("Data frame received: %s\n", string(f.Data()))
-				//		default:
-				//			log.Println("frame", frame)
-				//
-				//		}
-				//	}
-				//}()
-
 				pr, pw := io.Pipe()
+
 				go func() {
 					b := make([]byte, len(http2.ClientPreface))
 					if _, err := io.ReadFull(rawClientTls, b); err != nil {
@@ -297,6 +256,9 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 
 					framer := http2.NewFramer(nil, rawClientTls)
 					framer2 := http2.NewFramer(pw, nil)
+					hDec := hpack.NewDecoder(4096, func(hf hpack.HeaderField) {})
+					hBuf := bytes.NewBuffer(nil)
+					hEnc := hpack.NewEncoder(hBuf)
 					for {
 						frame, err := framer.ReadFrame()
 						if err == io.EOF {
@@ -310,9 +272,6 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							return
 						}
 						header := frame.Header()
-						hDec := hpack.NewDecoder(4096, func(hf hpack.HeaderField) {})
-						hEnc := hpack.NewEncoder(pw)
-						hBuf := bytes.NewBuffer(nil)
 
 						switch f := frame.(type) {
 						case *http2.DataFrame:
@@ -328,6 +287,9 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							headerOderKey := ""
 							pseudoHeaderOderKey := ""
 							for k, v := range headerFields {
+								if v.Name == "__pseudo_header_order_string__" || v.Name == "__header_order_string__" {
+									continue
+								}
 								if k < 4 {
 									pseudoHeaderOderKey += v.Name + ","
 								} else {
@@ -335,11 +297,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 								}
 								hEnc.WriteField(hpack.HeaderField{Name: v.Name, Value: v.Value})
 							}
-							//先省略了ctx.rawHeader、order的写入 后面使用时要注意
-							hEnc.WriteField(hpack.HeaderField{Name: req.HeaderOderKey, Value: headerOderKey})
-							hEnc.WriteField(hpack.HeaderField{Name: req.PseudoHeaderOderKey, Value: pseudoHeaderOderKey})
+							hEnc.WriteField(hpack.HeaderField{Name: "__pseudo_header_order_string__", Value: pseudoHeaderOderKey})
+							hEnc.WriteField(hpack.HeaderField{Name: "__header_order_string__", Value: headerOderKey})
 							framer2.WriteHeaders(http2.HeadersFrameParam{
-								StreamID: header.StreamID,
+								StreamID: f.StreamID,
 								//BlockFragment: f.HeaderBlockFragment(),
 								BlockFragment: hBuf.Bytes(),
 								EndStream:     f.StreamEnded(),
@@ -352,22 +313,32 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						case *http2.RSTStreamFrame:
 							framer2.WriteRSTStream(header.StreamID, f.ErrCode)
 						case *http2.SettingsFrame:
-							//这样会报错connection error: PROTOCOL_ERROR
-							//settings := make([]http2.Setting, f.NumSettings())
-							//for i := 0; i < f.NumSettings(); i++ {
-							//	settings[i] = f.Setting(i)
-							//}
-							//err := framer2.WriteSettings(settings...)
-
-							var buf []byte
-							for i := 0; i < f.NumSettings(); i++ {
-								setting := f.Setting(i)
-								buf = append(buf, byte(setting.ID>>8), byte(setting.ID), byte(setting.Val>>24), byte(setting.Val>>16), byte(setting.Val>>8), byte(setting.Val))
+							if f.IsAck() {
+								framer2.WriteSettingsAck()
+								break
 							}
-							framer2.WriteRawFrame(header.Type, header.Flags, header.StreamID, buf)
+							settings := make([]http2.Setting, f.NumSettings())
+							for i := 0; i < f.NumSettings(); i++ {
+								settings[i] = f.Setting(i)
+							}
+							framer2.WriteSettings(settings...)
+
+							//var buf []byte
+							//for i := 0; i < f.NumSettings(); i++ {
+							//	setting := f.Setting(i)
+							//	buf = append(buf, byte(setting.ID>>8), byte(setting.ID), byte(setting.Val>>24), byte(setting.Val>>16), byte(setting.Val>>8), byte(setting.Val))
+							//}
+							//framer2.WriteRawFrame(header.Type, header.Flags, header.StreamID, buf)
 
 						case *http2.PushPromiseFrame:
-							framer2.WriteRawFrame(header.Type, header.Flags, header.StreamID, f.HeaderBlockFragment())
+							//framer2.WriteRawFrame(header.Type, header.Flags, header.StreamID, f.HeaderBlockFragment())
+							framer2.WritePushPromise(http2.PushPromiseParam{
+								StreamID:      f.StreamID,
+								PromiseID:     f.PromiseID,
+								BlockFragment: f.HeaderBlockFragment(),
+								EndHeaders:    f.HeadersEnded(),
+								PadLength:     0,
+							})
 						case *http2.PingFrame:
 							framer2.WritePing(f.IsAck(), f.Data)
 						case *http2.GoAwayFrame:
@@ -397,29 +368,19 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							return
 						}
 
-						rawRequest, err := httputil.DumpRequest(req, false)
-						if err != nil {
-							ctx.Warnf("Cannot dump request: %v", err)
-							return
-						}
-						ctx.RawRequest = rawRequest
-						lines := strings.Split(strings.Split(string(ctx.RawRequest), "\r\n\r\n")[0], "\r\n")
-						keys := make([]string, 0, len(lines))
-						for _, line := range lines[1:] {
-							parts := strings.Split(line, ":")
-							if len(parts) > 0 {
-								keys = append(keys, parts[0])
-							}
-						}
-						ctx.HeaderOrder = keys
-
+						//ctx.RawRequest这里没有实现   没什么用 可以考虑都删了
+						ctx.HeaderOrder = strings.Split(req.Header["__header_order_string__"][0], ",")
+						ctx.PseudoHeaderOderKey = strings.Split(req.Header["__pseudo_header_order_string__"][0], ",")
+						req.Header.Del("__header_order_string__")
+						req.Header.Del("__pseudo_header_order_string__")
+						log.Println(req)
 						if !httpsRegexp.MatchString(req.URL.String()) {
 							req.URL, _ = url.Parse("https://" + r.Host + req.URL.String())
 						}
 						ctx.Req = req
 						req, resp := proxy.filterRequest(req, ctx)
 						removeProxyHeaders(ctx, req)
-						resp, err = func() (*http.Response, error) {
+						resp, err := func() (*http.Response, error) {
 							defer req.Body.Close()
 							return ctx.RoundTrip(req)
 							//return http.DefaultTransport.RoundTrip(req)

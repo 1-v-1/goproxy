@@ -113,8 +113,8 @@ func removeProxyHeaders(ctx *ProxyCtx, r *http.Request) {
 		r.Close = false
 	}
 	r.Header.Del("Connection")
-	r.Header.Del(rreq.HeaderOderKey)
-	r.Header.Del(rreq.PseudoHeaderOderKey)
+	//r.Header.Del(rreq.HeaderOderKey)
+	//r.Header.Del(rreq.PseudoHeaderOderKey)
 }
 
 type flushWriter struct {
