@@ -11,7 +11,6 @@ import (
 	"golang.org/x/net/http2/hpack"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -250,7 +249,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				go func() {
 					b := make([]byte, len(http2.ClientPreface))
 					if _, err := io.ReadFull(rawClientTls, b); err != nil {
-						log.Println("read preface err", err)
+						ctx.Warnf("read preface err %s", err)
 					}
 					pw.Write(b)
 
@@ -262,12 +261,12 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					for {
 						frame, err := framer.ReadFrame()
 						if err == io.EOF {
-							log.Println("EOF")
+							ctx.Warnf("EOF")
 							pw.Close()
 							return
 						}
 						if err != nil {
-							//log.Println("read frame err", err)  每一次请求结束都会到这来，或许有更好的转发方式
+							//ctx.Warnf("read frame err", err)  每一次请求结束都会到这来，或许有更好的转发方式
 							pw.Close()
 							return
 						}
@@ -279,7 +278,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						case *http2.HeadersFrame:
 							headerFields, err := hDec.DecodeFull(f.HeaderBlockFragment())
 							if err != nil {
-								log.Printf("Failed to decode header block: %v\n", err)
+								ctx.Warnf("Failed to decode header block: %v\n", err)
 								pw.Close()
 							}
 
@@ -350,7 +349,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						case *http2.UnknownFrame:
 							framer2.WriteRawFrame(header.Type, header.Flags, header.StreamID, f.Payload())
 						default:
-							log.Println("未知帧")
+							ctx.Warnf("未知帧")
 						}
 					}
 				}()
@@ -373,7 +372,6 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						ctx.PseudoHeaderOderKey = strings.Split(req.Header["__pseudo_header_order_string__"][0], ",")
 						req.Header.Del("__header_order_string__")
 						req.Header.Del("__pseudo_header_order_string__")
-						log.Println(req)
 						if !httpsRegexp.MatchString(req.URL.String()) {
 							req.URL, _ = url.Parse("https://" + r.Host + req.URL.String())
 						}
